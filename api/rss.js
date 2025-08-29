@@ -3,61 +3,57 @@ import Parser from "rss-parser";
 const parser = new Parser({
   customFields: {
     item: [
+      ["media:content", "media", { keepArray: true }],
       ["media:thumbnail", "thumbnail"],
-      ["media:content", "mediaContent"],
-      ["image", "image"]
+      ["description", "description"],
+      ["content:encoded", "content"]
     ]
   }
 });
 
 export default async function handler(req, res) {
-  const { rss_url, count } = req.query;
+  res.setHeader("Access-Control-Allow-Origin", "*"); // Allow all origins
+  res.setHeader("Access-Control-Allow-Methods", "GET");
 
-  if (!rss_url) {
-    return res.status(400).json({ error: "rss_url parameter required" });
+  const { url } = req.query;
+  if (!url) {
+    return res.status(400).json({
+      success: false,
+      message: "Please provide an RSS feed URL ?url=https://..."
+    });
   }
 
   try {
-    const feed = await parser.parseURL(rss_url);
+    const feed = await parser.parseURL(url);
 
-    // limit results if count is passed
-    let items = feed.items;
-    if (count) {
-      const limit = parseInt(count, 10);
-      if (!isNaN(limit)) {
-        items = items.slice(0, limit);
-      }
-    }
+    const items = feed.items.map((item, index) => ({
+      sno: index + 1,
+      title: item.title || "",
+      link: item.link || "",
+      pubDate: item.pubDate || "",
+      author: item.creator || item.author || "",
+      categories: item.categories || [],
+      description: item.description || "",
+      content: item.content || "",
+      thumbnail: item.thumbnail || (item.media && item.media[0]?.$.url) || "",
+    }));
 
     res.status(200).json({
-      status: "ok",
-      total: items.length, // 👈 total news count
+      success: true,
       feed: {
         title: feed.title,
-        link: feed.link,
         description: feed.description,
+        link: feed.link,
+        lastBuildDate: feed.lastBuildDate,
+        totalItems: items.length
       },
-      items: items.map(item => {
-        // try to detect a thumbnail image
-        let thumbnail =
-          item.thumbnail ||
-          (item.enclosure && item.enclosure.url) ||
-          (item.mediaContent && item.mediaContent.url) ||
-          "";
-
-        return {
-          title: item.title || "",
-          link: item.link || "",
-          pubDate: item.pubDate || "",
-          author: item.creator || item.author || "",
-          categories: item.categories || [],
-          content: item["content:encoded"] || item.content || "", // 👈 exact content
-          thumbnail: thumbnail, // 👈 image/thumbnail
-          guid: item.guid || ""
-        };
-      }),
+      items
     });
   } catch (error) {
-    res.status(500).json({ error: "Failed to fetch RSS", details: error.message });
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch or parse RSS feed",
+      error: error.message
+    });
   }
 }
