@@ -98,187 +98,271 @@ const parser = new Parser({
   }
 });
 
-// Extract image from various sources
+// Normalize and clean URL
+function normalizeUrl(url) {
+  if (!url || typeof url !== 'string') return null;
+  
+  try {
+    // Remove query parameters that might make URLs look different but point to same image
+    const urlObj = new URL(url.trim());
+    // Keep essential query params but remove cache busters, tracking params
+    const paramsToKeep = ['w', 'h', 'width', 'height', 'quality', 'format', 'fit', 'crop'];
+    const newSearchParams = new URLSearchParams();
+    
+    for (const [key, value] of urlObj.searchParams) {
+      if (paramsToKeep.some(param => key.toLowerCase().includes(param))) {
+        newSearchParams.set(key, value);
+      }
+    }
+    
+    urlObj.search = newSearchParams.toString();
+    return urlObj.toString();
+  } catch {
+    // If URL parsing fails, just return cleaned string
+    return url.trim();
+  }
+}
+
+// Extract image from various sources with proper deduplication
 function extractImages(item) {
-  const images = [];
+  const imageMap = new Map(); // Use Map to track unique URLs with their metadata
   
-  // Try different image sources
-  const imageSources = [
-    item.thumbnail,
-    item.mediaThumbnail,
-    item.mediaContent,
-    item.image,
-    item.featuredImage,
-    item.ogImage,
-    item.twitterImage,
-    item.enclosure
-  ];
+  // Helper function to add image with deduplication
+  function addImage(url, type, metadata = {}) {
+    const normalizedUrl = normalizeUrl(url);
+    if (!normalizedUrl) return;
+    
+    const existing = imageMap.get(normalizedUrl);
+    if (!existing || (existing.priority || 99) > (metadata.priority || 99)) {
+      imageMap.set(normalizedUrl, {
+        url: normalizedUrl,
+        originalUrl: url,
+        type,
+        priority: metadata.priority || 99,
+        ...metadata
+      });
+    }
+  }
   
-  // Extract from media content
+  // 1. Extract from media content (highest priority for media feeds)
   if (item.mediaContent && Array.isArray(item.mediaContent)) {
     item.mediaContent.forEach(media => {
       if (media && media.$ && media.$.url) {
         const mediaType = media.$.type || '';
         if (mediaType.startsWith('image/') || media.$.medium === 'image') {
-          images.push({
-            url: media.$.url,
-            type: 'media:content',
-            width: media.$.width || null,
-            height: media.$.height || null,
-            size: media.$.fileSize || null
+          addImage(media.$.url, 'media:content', {
+            priority: 1,
+            width: media.$.width ? parseInt(media.$.width) : null,
+            height: media.$.height ? parseInt(media.$.height) : null,
+            size: media.$.fileSize ? parseInt(media.$.fileSize) : null,
+            mimeType: media.$.type
           });
         }
       }
     });
   }
   
-  // Extract from media thumbnail
+  // 2. Extract from media thumbnail (second priority)
   if (item.mediaThumbnail) {
     const thumbnails = Array.isArray(item.mediaThumbnail) ? item.mediaThumbnail : [item.mediaThumbnail];
     thumbnails.forEach(thumb => {
       if (thumb && thumb.$ && thumb.$.url) {
-        images.push({
-          url: thumb.$.url,
-          type: 'media:thumbnail',
-          width: thumb.$.width || null,
-          height: thumb.$.height || null
+        addImage(thumb.$.url, 'media:thumbnail', {
+          priority: 2,
+          width: thumb.$.width ? parseInt(thumb.$.width) : null,
+          height: thumb.$.height ? parseInt(thumb.$.height) : null
         });
       }
     });
   }
   
-  // Extract from enclosure
-  if (item.enclosure && item.enclosure.url && item.enclosure.type && item.enclosure.type.startsWith('image/')) {
-    images.push({
-      url: item.enclosure.url,
-      type: 'enclosure',
-      size: item.enclosure.length || null
+  // 3. Extract from enclosure (for RSS feeds)
+  if (item.enclosure && item.enclosure.url && item.enclosure.type && 
+      item.enclosure.type.startsWith('image/')) {
+    addImage(item.enclosure.url, 'enclosure', {
+      priority: 3,
+      size: item.enclosure.length ? parseInt(item.enclosure.length) : null,
+      mimeType: item.enclosure.type
     });
   }
   
-  // Extract from simple fields
-  [item.thumbnail, item.image, item.featuredImage, item.ogImage, item.twitterImage].forEach((imgUrl, index) => {
-    if (imgUrl && typeof imgUrl === 'string') {
-      const types = ['thumbnail', 'image', 'featuredImage', 'og:image', 'twitter:image'];
-      images.push({
-        url: imgUrl,
-        type: types[index]
-      });
+  // 4. Extract from dedicated image fields
+  const imageFields = [
+    { field: item.featuredImage, type: 'featured', priority: 4 },
+    { field: item.image, type: 'image', priority: 5 },
+    { field: item.thumbnail, type: 'thumbnail', priority: 6 },
+    { field: item.ogImage, type: 'og:image', priority: 7 },
+    { field: item.twitterImage, type: 'twitter:image', priority: 8 }
+  ];
+  
+  imageFields.forEach(({ field, type, priority }) => {
+    if (field && typeof field === 'string') {
+      addImage(field, type, { priority });
     }
   });
   
-  // Extract images from content
+  // 5. Extract images from content (lowest priority, as these might be inline)
   const contentSources = [item.contentEncoded, item.content, item.description];
-  contentSources.forEach(content => {
+  contentSources.forEach((content, contentIndex) => {
     if (content && typeof content === 'string') {
-      const imgRegex = /<img[^>]+src=["']([^"']+)["'][^>]*>/gi;
+      const imgRegex = /<img[^>]+src=["']([^"']+)["'][^>]*(?:width=["']([^"']*)["'])?[^>]*(?:height=["']([^"']*)["'])?[^>]*>/gi;
       let match;
       while ((match = imgRegex.exec(content)) !== null) {
-        images.push({
-          url: match[1],
-          type: 'content-extracted'
+        addImage(match[1], 'content-extracted', {
+          priority: 10 + contentIndex, // Lower priority for content images
+          width: match[2] ? parseInt(match[2]) : null,
+          height: match[3] ? parseInt(match[3]) : null
         });
       }
     }
   });
   
-  // Remove duplicates and return
-  const uniqueImages = [];
-  const seenUrls = new Set();
-  
-  images.forEach(img => {
-    if (img.url && !seenUrls.has(img.url)) {
-      seenUrls.add(img.url);
-      uniqueImages.push(img);
-    }
-  });
+  // Convert Map to Array and sort by priority
+  const uniqueImages = Array.from(imageMap.values())
+    .sort((a, b) => (a.priority || 99) - (b.priority || 99))
+    .map(img => {
+      // Clean up the final object
+      const { priority, originalUrl, ...cleanImg } = img;
+      return cleanImg;
+    });
   
   return uniqueImages;
 }
 
-// Extract author information
+// Extract author information with deduplication
 function extractAuthor(item) {
-  const authors = [];
+  const authors = new Set(); // Use Set to prevent duplicates
+  const authorObjects = [];
   
   const authorSources = [
-    { value: item.creator, type: 'creator' },
-    { value: item.author, type: 'author' },
-    { value: item.dcCreator, type: 'dc:creator' },
-    { value: item.managingEditor, type: 'managingEditor' },
-    { value: item.itunesAuthor, type: 'itunes:author' },
-    { value: item.by, type: 'by' },
-    { value: item.source, type: 'source' }
+    { value: item.creator, type: 'creator', priority: 1 },
+    { value: item.author, type: 'author', priority: 2 },
+    { value: item.dcCreator, type: 'dc:creator', priority: 3 },
+    { value: item.itunesAuthor, type: 'itunes:author', priority: 4 },
+    { value: item.managingEditor, type: 'managingEditor', priority: 5 },
+    { value: item.by, type: 'by', priority: 6 },
+    { value: item.source, type: 'source', priority: 7 }
   ];
   
-  authorSources.forEach(source => {
-    if (source.value && typeof source.value === 'string') {
-      // Clean email addresses from author names
-      const cleanAuthor = source.value.replace(/\s*\([^)]*\)\s*/, '').replace(/\s*<[^>]*>\s*/, '').trim();
-      if (cleanAuthor && !authors.some(a => a.name === cleanAuthor)) {
-        authors.push({
+  authorSources
+    .filter(source => source.value && typeof source.value === 'string')
+    .sort((a, b) => a.priority - b.priority)
+    .forEach(source => {
+      // Clean email addresses and extra info from author names
+      const cleanAuthor = source.value
+        .replace(/\s*\([^)]*\)\s*/g, '') // Remove content in parentheses
+        .replace(/\s*<[^>]*>\s*/g, '')   // Remove email addresses
+        .replace(/\s*\[[^\]]*\]\s*/g, '') // Remove content in brackets
+        .trim();
+        
+      if (cleanAuthor && !authors.has(cleanAuthor.toLowerCase())) {
+        authors.add(cleanAuthor.toLowerCase());
+        authorObjects.push({
           name: cleanAuthor,
           type: source.type,
           raw: source.value
         });
       }
+    });
+  
+  return authorObjects;
+}
+
+// Extract and clean content with proper separation
+function extractContent(item) {
+  const contentTypes = {
+    contentEncoded: { value: item.contentEncoded, priority: 1, name: 'Full Content' },
+    content: { value: item.content, priority: 2, name: 'Content' },
+    description: { value: item.description, priority: 3, name: 'Description' },
+    summary: { value: item.summary, priority: 4, name: 'Summary' }
+  };
+  
+  const processedContent = {};
+  
+  // Process each content type separately
+  Object.entries(contentTypes).forEach(([key, config]) => {
+    if (config.value && typeof config.value === 'string' && config.value.trim()) {
+      const htmlContent = config.value.trim();
+      const textContent = htmlContent.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+      
+      if (textContent) { // Only add if there's actual text content
+        processedContent[key] = {
+          html: htmlContent,
+          text: textContent,
+          length: textContent.length,
+          type: key,
+          name: config.name,
+          priority: config.priority
+        };
+      }
     }
   });
   
-  return authors;
+  // Create a contents array for backward compatibility
+  const contents = Object.values(processedContent)
+    .sort((a, b) => a.priority - b.priority);
+  
+  return {
+    // Individual content types (new structure)
+    ...processedContent,
+    
+    // Array format for backward compatibility
+    all: contents,
+    
+    // Helper methods
+    getBest: () => contents[0] || null,
+    getText: () => contents[0]?.text || '',
+    getHtml: () => contents[0]?.html || ''
+  };
 }
 
-// Extract and clean content
-function extractContent(item) {
-  const contentSources = [
-    { value: item.contentEncoded, type: 'content:encoded', priority: 1 },
-    { value: item.content, type: 'content', priority: 2 },
-    { value: item.summary, type: 'summary', priority: 3 },
-    { value: item.description, type: 'description', priority: 4 }
-  ];
-  
-  const contents = contentSources
-    .filter(c => c.value && typeof c.value === 'string' && c.value.trim())
-    .sort((a, b) => a.priority - b.priority)
-    .map(c => ({
-      text: c.value.replace(/<[^>]*>/g, '').trim(),
-      html: c.value,
-      type: c.type,
-      length: c.value.replace(/<[^>]*>/g, '').trim().length
-    }));
-  
-  return contents;
-}
-
-// Extract categories and tags
+// Extract categories and tags with deduplication
 function extractCategories(item) {
-  const categories = new Set();
+  const categorySet = new Set();
   
-  // Extract from different category fields
-  [item.categories, item.category, item.tags].forEach(catSource => {
-    if (Array.isArray(catSource)) {
-      catSource.forEach(cat => {
-        if (typeof cat === 'string') {
-          categories.add(cat.trim());
-        } else if (cat && cat._) {
-          categories.add(cat._.trim());
+  // Helper to add categories
+  function addCategories(source, separator = ',') {
+    if (!source) return;
+    
+    if (Array.isArray(source)) {
+      source.forEach(cat => {
+        if (typeof cat === 'string' && cat.trim()) {
+          categorySet.add(cat.trim());
+        } else if (cat && cat._ && typeof cat._ === 'string') {
+          categorySet.add(cat._.trim());
+        } else if (cat && cat.name && typeof cat.name === 'string') {
+          categorySet.add(cat.name.trim());
         }
       });
-    } else if (typeof catSource === 'string') {
-      // Split comma-separated categories
-      catSource.split(',').forEach(cat => {
-        categories.add(cat.trim());
+    } else if (typeof source === 'string' && source.trim()) {
+      source.split(separator).forEach(cat => {
+        const cleaned = cat.trim();
+        if (cleaned) categorySet.add(cleaned);
       });
+    }
+  }
+  
+  // Extract from different sources
+  addCategories(item.categories);
+  addCategories(item.category);
+  addCategories(item.tags);
+  addCategories(item.keywords);
+  addCategories(item.subject);
+  
+  // Convert to array and filter out duplicates (case-insensitive)
+  const categories = Array.from(categorySet);
+  const uniqueCategories = [];
+  const seenLower = new Set();
+  
+  categories.forEach(cat => {
+    const lowerCat = cat.toLowerCase();
+    if (!seenLower.has(lowerCat)) {
+      seenLower.add(lowerCat);
+      uniqueCategories.push(cat);
     }
   });
   
-  // Extract from keywords
-  if (item.keywords) {
-    item.keywords.split(',').forEach(keyword => {
-      categories.add(keyword.trim());
-    });
-  }
-  
-  return Array.from(categories).filter(cat => cat.length > 0);
+  return uniqueCategories;
 }
 
 // Parse and normalize dates
@@ -287,6 +371,10 @@ function parseDate(dateStr) {
   
   try {
     const date = new Date(dateStr);
+    if (isNaN(date.getTime())) {
+      return { raw: dateStr, error: 'Invalid date format' };
+    }
+    
     return {
       iso: date.toISOString(),
       unix: date.getTime(),
@@ -297,7 +385,8 @@ function parseDate(dateStr) {
         hour: '2-digit',
         minute: '2-digit'
       }),
-      relative: getRelativeTime(date)
+      relative: getRelativeTime(date),
+      raw: dateStr
     };
   } catch (error) {
     return { raw: dateStr, error: 'Invalid date format' };
@@ -349,7 +438,7 @@ export default async function handler(req, res) {
     let items = feed.items.map((item, index) => {
       const images = extractImages(item);
       const authors = extractAuthor(item);
-      const contents = extractContent(item);
+      const contentData = extractContent(item);
       const categories = extractCategories(item);
       
       // Get the best date available
@@ -376,17 +465,35 @@ export default async function handler(req, res) {
         authors: authors,
         primaryAuthor: authors.length > 0 ? authors[0].name : "Unknown",
         
-        // Content
-        contents: contents,
-        description: contents.find(c => c.type === 'description')?.text || "",
-        summary: contents.find(c => c.type === 'summary')?.text || "",
-        fullContent: contents.find(c => c.type === 'content:encoded')?.html || 
-                    contents.find(c => c.type === 'content')?.html || "",
+        // Content (NEW: Properly separated content types)
+        content: {
+          // Best available content
+          title: item.title || "Untitled",
+          description: contentData.description?.text || "",
+          summary: contentData.summary?.text || "", 
+          fullContent: contentData.contentEncoded?.html || contentData.content?.html || "",
+          
+          // All content types available
+          available: Object.keys(contentData).filter(key => key !== 'all' && key !== 'getBest' && key !== 'getText' && key !== 'getHtml'),
+          
+          // Detailed breakdown
+          details: contentData,
+          
+          // Quick access
+          bestText: contentData.getText(),
+          bestHtml: contentData.getHtml()
+        },
         
-        // Images
+        // Legacy fields for backward compatibility
+        description: contentData.description?.text || contentData.getBest()?.text || "",
+        summary: contentData.summary?.text || "",
+        fullContent: contentData.contentEncoded?.html || contentData.content?.html || "",
+        
+        // Images (FIXED: No more duplicates)
         images: images,
-        thumbnail: images.length > 0 ? images[0].url : "",
-        allThumbnails: images.map(img => img.url),
+        thumbnail: images.length > 0 ? images[0].url : null,
+        thumbnails: images.slice(0, 3).map(img => img.url), // Max 3 thumbnails
+        featuredImage: images.find(img => img.type === 'featured')?.url || images[0]?.url || null,
         
         // Categories and tags
         categories: categories,
@@ -424,10 +531,18 @@ export default async function handler(req, res) {
         
         // Content metrics
         metrics: {
-          contentLength: contents.reduce((max, c) => Math.max(max, c.length), 0),
+          contentLength: Math.max(
+            contentData.description?.length || 0,
+            contentData.summary?.length || 0,
+            contentData.contentEncoded?.length || 0,
+            contentData.content?.length || 0
+          ),
           imageCount: images.length,
           categoryCount: categories.length,
-          authorCount: authors.length
+          authorCount: authors.length,
+          uniqueContentTypes: Object.keys(contentData).filter(key => 
+            !['all', 'getBest', 'getText', 'getHtml'].includes(key)
+          ).length
         }
       };
     });
@@ -503,9 +618,9 @@ export default async function handler(req, res) {
         hasMore: startIndex + items.length < totalItems,
         
         // Content analysis
-        avgContentLength: Math.round(
+        avgContentLength: items.length > 0 ? Math.round(
           items.reduce((sum, item) => sum + item.metrics.contentLength, 0) / items.length
-        ),
+        ) : 0,
         totalImages: items.reduce((sum, item) => sum + item.metrics.imageCount, 0),
         uniqueAuthors: new Set(items.map(item => item.primaryAuthor)).size,
         uniqueCategories: new Set(items.flatMap(item => item.categories)).size,
